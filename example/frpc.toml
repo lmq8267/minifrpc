@@ -1,0 +1,46 @@
+# minifrpc 示例配置（对齐 frp 0.71 TOML 格式）
+# 当前仅支持 TCP/UDP 代理 + Proxy Protocol v2
+
+# 用户标识（可选）
+user = "s-00tnkgv5445sv"
+
+# 认证 token
+auth.token = "cvv8sd1f8vdsfe4scbwkiv"
+
+# frps 服务器地址与端口
+serverAddr = "frp-abc.com"
+serverPort = 8088
+
+# 传输层（仅支持 tcp 协议、TLS 关闭）
+transport.protocol = "tcp"
+transport.tls.enable = false
+transport.tls.disableCustomTLSFirstByte = false
+
+# 日志
+log.level = "info"
+log.to = "console"
+
+# TCP 代理示例
+[[proxies]]
+name = "test"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 18080
+
+# UDP 代理示例（如需启用，取消注释）
+# [[proxies]]
+# name = "udp-test"
+# type = "udp"
+# localIP = "127.0.0.1"
+# localPort = 8082
+# remotePort = 18082
+
+# Proxy Protocol v2 示例（如需给本地服务传真实客户端 IP，取消注释）
+# [[proxies]]
+# name = "tcp-pp"
+# type = "tcp"
+# localIP = "127.0.0.1"
+# localPort = 8083
+# remotePort = 18083
+# transport.proxyProtocolVersion = "v2"

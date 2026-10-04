@@ -1,0 +1,97 @@
+name: 编译测试
+
+# push 触发：动态（gcc）与静态（musl-gcc）矩阵编译，并输出编译摘要到 Step Summary
+on:
+  push:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    name: ${{ matrix.desc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - desc: 动态链接（gcc）
+            cc: gcc
+            link_desc: 动态链接可执行文件（依赖系统 libc）
+          - desc: 静态链接（musl-gcc）
+            cc: musl-gcc
+            link_desc: 完全静态（musl，无外部运行时依赖）
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@main
+
+      - name: 安装编译工具（含 musl-gcc）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake musl-tools
+          echo "musl-gcc 版本：" && (musl-gcc --version | head -1 || true)
+          sudo timedatectl set-timezone "Asia/Shanghai"
+
+      - name: 编译（自动编译 vendor 本地依赖，不联网）
+        run: make CC=${{ matrix.cc }}
+
+      - name: 自检并输出摘要到 STEP_SUMMARY
+        run: |
+          set -e
+          BIN=build/minifrpc
+          export LD_LIBRARY_PATH="$PWD/deps/lib:$LD_LIBRARY_PATH"
+          SIZE_B=$(stat -c%s "$BIN")
+          SIZE_H=$(du -h "$BIN" | cut -f1)
+          VERSION=$("$BIN" -v 2>&1 | head -1)
+          if "$BIN" -h >/dev/null 2>&1; then HELP="通过"; else HELP="失败"; fi
+          FILEINFO=$(file -b "$BIN")
+          HAXI=$(git rev-parse HEAD 2>/dev/null || echo main)
+          PREV=$(git rev-parse HEAD^ 2>/dev/null || echo)
+
+          {
+            echo "## 编译结果：${{ matrix.desc }}"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| 编译器 | \`${{ matrix.cc }}\` |"
+            echo "| 链接方式 | ${{ matrix.link_desc }} |"
+            echo "| 产物体积 | ${SIZE_H}（${SIZE_B} 字节） |"
+            echo "| 版本 | ${VERSION} |"
+            echo "| -h 帮助自检 | ${HELP} |"
+            echo "| 文件类型 | \`${FILEINFO}\` |"
+            echo ""
+            echo "[![AskDeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/${{ github.repository }})"
+            echo ""
+            echo "[提交记录](https://github.com/${{ github.repository }}/tree/${HAXI})"
+            echo ""
+            if [ -n "${PREV}" ]; then
+              echo "**更改记录**: https://github.com/${{ github.repository }}/compare/${PREV}...${HAXI}"
+            else
+              echo "**更改记录**: https://github.com/${{ github.repository }}/commits/${HAXI}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # 删除旧的流程记录（保留 2 天），避免堆积
+  del:
+    name: 清理旧流程记录
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: 删除所有失败的流程记录（不限天数）
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 0
+          keep_minimum_runs: 0
+          delete_run_by_conclusion_pattern: failure
+
+      - name: 删除旧的流程记录（保留 2 天）
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 2
+          keep_minimum_runs: 0
+

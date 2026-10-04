@@ -1,0 +1,258 @@
+name: 发布 Release
+
+# push 或手动触发；多架构 musl 交叉编译，tag 为版本号（日期 + git 短哈希）
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+  # 全部目标架构（用于生成发布说明表格）
+  ARCH_LIST: >-
+    aarch64-linux-musl x86_64-linux-musl x86-32-linux-musl
+    armv7-linux-musleabihf armv7-linux-musleabi
+    arm-linux-musleabihf arm-linux-musleabi
+    mipsel-linux-musl mips-linux-musl
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-musl
+            url: aarch64-linux-musl
+          - target: x86_64-linux-musl
+            url: x86_64-linux-musl
+          - target: x86-32-linux-musl
+            url: i686-linux-musl
+          - target: armv7-linux-musleabihf
+            url: armv7l-linux-musleabihf
+          - target: armv7-linux-musleabi
+            url: armv7m-linux-musleabi
+          - target: arm-linux-musleabihf
+            url: arm-linux-musleabihf
+          - target: arm-linux-musleabi
+            url: arm-linux-musleabi
+          - target: mipsel-linux-musl
+            url: mipsel-linux-muslsf
+          - target: mips-linux-musl
+            url: mips-linux-muslsf
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: 下载 musl 交叉编译工具链
+        uses: lmq8267/dl-musl@main
+        with:
+          target: ${{ matrix.url }}
+          static: true
+          gccpath: /tmp
+
+      - name: 编译（交叉静态 musl，依赖本地 vendor 自动编译）
+        run: |
+          echo "交叉编译器: $CC"
+          $CC -dumpmachine || true
+          sudo timedatectl set-timezone "Asia/Shanghai"
+          make CC="$CC"
+
+      - name: 确定版本号与构建时间
+        run: |
+          DATE=$(date +%Y%m%d)
+          HASH=$(git rev-parse --short HEAD 2>/dev/null || true)
+          if [ -n "$HASH" ]; then VERSION="${DATE}-${HASH}"; else VERSION="${DATE}"; fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "tag=${VERSION}" >> "$GITHUB_ENV"
+          echo "HAXI=$(git rev-parse HEAD 2>/dev/null || echo main)" >> "$GITHUB_ENV"
+          echo "PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo)" >> "$GITHUB_ENV"
+          echo "build_time=$(date '+%Y年%m月%d日%H:%M:%S' | jq -sRr @uri)" >> "$GITHUB_ENV"
+          echo "版本号: ${VERSION}"
+
+      - name: 生成未 UPX 产物
+        run: |
+          mkdir -p dist
+          cp build/minifrpc "dist/minifrpc-${{ matrix.target }}"
+
+      - name: 安装 UPX
+        uses: crazy-max/ghaction-upx@master
+        with:
+          version: v4.2.4
+          install-only: true
+
+      - name: 生成 UPX 产物（_upx 后缀）
+        run: |
+          cp build/minifrpc "dist/minifrpc-${{ matrix.target }}_upx"
+          upx --lzma --best "dist/minifrpc-${{ matrix.target }}_upx" || echo "UPX 压缩失败，保留原始文件"
+          echo "=== 产物 ==="
+          ls -lh dist/
+
+      - name: 生成本次架构的摘要到 STEP_SUMMARY
+        run: |
+          SZ_RAW=$(stat -c%s "dist/minifrpc-${{ matrix.target }}")
+          SZ_UPX=$(stat -c%s "dist/minifrpc-${{ matrix.target }}_upx")
+          SZ_RAW_H=$(du -h "dist/minifrpc-${{ matrix.target }}" | cut -f1)
+          SZ_UPX_H=$(du -h "dist/minifrpc-${{ matrix.target }}_upx" | cut -f1)
+          if [ "$SZ_RAW" -gt 0 ] && [ "$SZ_UPX" -gt 0 ]; then
+            RATE=$(( (SZ_RAW - SZ_UPX) * 100 / SZ_RAW ))
+          else
+            RATE=0
+          fi
+
+          {
+            echo "## 编译结果：${{ matrix.target }}"
+            echo ""
+            echo "| 文件 | 体积 | 说明 |"
+            echo "|------|------|------|"
+            echo "| minifrpc-${{ matrix.target }} | ${SZ_RAW_H}（${SZ_RAW} 字节） | 原始静态二进制，strip |"
+            echo "| minifrpc-${{ matrix.target }}_upx | ${SZ_UPX_H}（${SZ_UPX} 字节） | UPX --lzma --best 压缩版 |"
+            echo ""
+            echo "> 原始 ${SZ_RAW} 字节 → UPX ${SZ_UPX} 字节（压缩率 **${RATE}%**）。"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 生成发布说明（各架构文件下载链接表格）
+        run: |
+          BASE="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
+          {
+            echo "> ### ![](https://img.shields.io/badge/%E7%BC%96%E8%AF%91%E6%97%B6%E9%97%B4-${{ env.build_time }}-8267?logo=github&labelColor=%E9%A1%BB)![](https://img.shields.io/github/downloads/${{ github.repository }}/${{ env.tag }}/total?label=%E4%B8%8B%E8%BD%BD%E6%AC%A1%E6%95%B0&logo=github)[![AskDeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/${{ github.repository }})"
+            echo ""
+            echo "### minifrpc ${VERSION}"
+            echo ""
+            echo "纯 C 极简 frpc 客户端（兼容 Go frp 0.71.0），静态 musl 交叉编译。"
+            echo ""
+            echo "#### 编译产物"
+            echo ""
+            echo "| 架构 | 文件 | 说明 |"
+            echo "|------|------|------|"
+            for A in $ARCH_LIST; do
+              echo "| ${A} | [minifrpc-${A}](${BASE}/minifrpc-${A}) | 静态二进制（strip） |"
+              echo "| ${A} | [minifrpc-${A}_upx](${BASE}/minifrpc-${A}_upx) | UPX --lzma --best 压缩版 |"
+            done
+            echo ""
+            echo "#### 全架构打包"
+            echo ""
+            echo "| 文件 | 说明 |"
+            echo "|------|------|"
+            echo "| [minifrpc-linux-all.zip](${BASE}/minifrpc-linux-all.zip) | 全部架构二进制打包（含 UPX 版） |"
+            echo ""
+            echo "> 同一架构二选一下载即可；UPX 版首次运行时会自动解压。"
+            echo "> 下载后请执行 \`chmod +x minifrpc-*\` 赋予执行权限。"
+            echo ""
+            echo "用法：\`minifrpc -c <配置文件>\`，或 \`minifrpc -h\` 查看帮助。"
+            echo ""
+            echo "[提交记录](https://github.com/${{ github.repository }}/tree/${HAXI})"
+            echo ""
+            if [ -n "${PREV_TAG}" ]; then
+              echo "**更改记录**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${VERSION}"
+            else
+              echo "**更改记录**: https://github.com/${{ github.repository }}/commits/${VERSION}"
+            fi
+          } > release_body.md
+
+      - name: 追加下载链接表格到 STEP_SUMMARY
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat release_body.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传本架构产物（供全架构打包）
+        uses: actions/upload-artifact@main
+        with:
+          name: minifrpc-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: 发布 Release
+        uses: lmq8267/action-gh-release@master
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          make_latest: true
+          body_path: release_body.md
+          files: |
+            dist/minifrpc-${{ matrix.target }}
+            dist/minifrpc-${{ matrix.target }}_upx
+
+  # 汇总所有架构产物，打包为 minifrpc-linux-all.zip
+  package:
+    name: 打包全架构
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: 下载所有架构产物
+        uses: actions/download-artifact@main
+        with:
+          path: all
+          merge-multiple: true
+
+      - name: 确定版本号
+        run: |
+          DATE=$(date +%Y%m%d)
+          HASH=$(git rev-parse --short HEAD 2>/dev/null || true)
+          if [ -n "$HASH" ]; then VERSION="${DATE}-${HASH}"; else VERSION="${DATE}"; fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: 打包 minifrpc-linux-all.zip
+        run: |
+          mkdir -p dist
+          cp -f all/* dist/ 2>/dev/null || true
+          cd dist
+          zip -r "minifrpc-linux-all.zip" minifrpc-*
+          echo "=== 打包内容 ==="
+          unzip -l "minifrpc-linux-all.zip"
+          echo "=== 体积 ==="
+          ls -lh "minifrpc-linux-all.zip"
+
+      - name: 输出摘要到 STEP_SUMMARY
+        run: |
+          SZ=$(stat -c%s "dist/minifrpc-linux-all.zip")
+          SZ_H=$(du -h "dist/minifrpc-linux-all.zip" | cut -f1)
+          {
+            echo ""
+            echo "## 全架构打包"
+            echo ""
+            echo "| 文件 | 体积 | 说明 |"
+            echo "|------|------|------|"
+            echo "| minifrpc-linux-all.zip | ${SZ_H}（${SZ} 字节） | 全部架构二进制打包 |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 zip 到 Release
+        uses: lmq8267/action-gh-release@master
+        with:
+          tag_name: ${{ env.VERSION }}
+          files: dist/minifrpc-linux-all.zip
+
+  # 删除旧的流程记录，避免堆积
+  del:
+    name: 清理旧流程记录
+    runs-on: ubuntu-latest
+    needs: package
+    if: always()
+    steps:
+      - name: 删除所有失败的流程记录（不限天数）
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 0
+          keep_minimum_runs: 0
+          delete_run_by_conclusion_pattern: failure
+
+      - name: 删除旧的流程记录（保留 2 天）
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 2
+          keep_minimum_runs: 0
