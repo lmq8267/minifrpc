@@ -179,15 +179,18 @@ static int read_frame_from_evbuffer(struct evbuffer *in, uint8_t *type, char **j
     return 0;
 }
 
-/* 从 src 缓冲分发：帧模式逐帧解析，数据模式转发 */
-static void conn_dispatch(struct frp_conn *c, struct evbuffer *src)
+/*
+ * 从 src 缓冲分发：帧模式逐帧解析，数据模式转发。
+ * 返回 0 正常；返回 -1 表示连接已失效（回调内可能已释放 c），调用方不得再访问 c。
+ */
+static int conn_dispatch(struct frp_conn *c, struct evbuffer *src)
 {
     while (1) {
         if (c->frame_mode) {
             uint8_t type;
             char *json;
             int r = read_frame_from_evbuffer(src, &type, &json);
-            if (r == 1) return;  /* 数据不足 */
+            if (r == 1) return 0;  /* 数据不足 */
             if (r < 0) {
                 if (c->use_yamux) {
                     yamux_stream_close(c->ys);
@@ -196,19 +199,25 @@ static void conn_dispatch(struct frp_conn *c, struct evbuffer *src)
                     c->bev = NULL;
                 }
                 if (c->on_error) c->on_error(c);
-                return;
+                return -1;  /* on_error 对 work 连接会 free(t)，此后 c 已失效 */
             }
             int was_cfb = c->cfb_enabled;
-            if (c->on_frame) c->on_frame(c, type, json);
+            int cont = 0;
+            if (c->on_frame) cont = c->on_frame(c, type, json);
             free(json);
-            if (c->cfb_enabled != was_cfb) return;
+            /*
+             * 关键：work 连接的帧回调链会 tunnel_free(t)（c == &t->work），
+             * 此时 c 与 src 均已失效，绝不能再访问。必须依赖回调返回值判断。
+             */
+            if (cont != 0) return -1;
+            if (c->cfb_enabled != was_cfb) return 0;
             continue;
         } else {
             if (c->on_data && evbuffer_get_length(src) > 0) {
                 c->on_data(c, src);
                 evbuffer_drain(src, evbuffer_get_length(src));
             }
-            return;
+            return 0;
         }
     }
 }
@@ -229,6 +238,12 @@ static void conn_process_input(struct frp_conn *c)
         if (len > 0) {
             uint8_t *tmp = malloc(len);
             uint8_t *dec = malloc(len);
+            if (!tmp || !dec) {
+                free(tmp);
+                free(dec);
+                log_error("内存分配失败（解密缓冲）");
+                return;
+            }
             evbuffer_copyout(input, tmp, len);
             aes_cfb_decrypt(&c->cfb.read, tmp, dec, len);
             evbuffer_add(c->plain, dec, len);
@@ -236,9 +251,10 @@ static void conn_process_input(struct frp_conn *c)
             free(tmp);
             free(dec);
         }
-        conn_dispatch(c, c->plain);
+        /* c 可能已在回调中被释放（work 连接），返回后不得再访问 */
+        if (conn_dispatch(c, c->plain) != 0) return;
     } else {
-        conn_dispatch(c, input);
+        if (conn_dispatch(c, input) != 0) return;
         if (c->cfb_enabled) {
             conn_process_input(c);
         }
@@ -257,11 +273,11 @@ static int work_connect(struct frp_client *cl);
 static struct proxy *find_proxy(struct frp_client *cl, const char *name);
 static void send_login(struct frp_client *cl);
 static void register_all_proxies(struct frp_client *cl);
-static void ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json);
+static int ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json);
 static void on_session_connect(struct yamux_session *s, void *ctx);
 static void on_ctl_stream_data(struct yamux_stream *ys, void *ctx);
-static void udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc);
-static void udp_work_on_frame(struct frp_conn *c, uint8_t type, const char *json);
+static int udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc);
+static int udp_work_on_frame(struct frp_conn *c, uint8_t type, const char *json);
 static void udp_local_read_cb(int fd, short what, void *ctx);
 static void tunnel_free(struct tunnel *t);
 static void work_on_error(struct frp_conn *c);
@@ -279,7 +295,9 @@ static void udp_ping_cb(int fd, short what, void *ctx);
 static void send_login(struct frp_client *cl)
 {
     int64_t now = (int64_t)time(NULL);
-    char *json = login_msg_build(cl->cfg, "", now);
+    /* 重连时带上原 run_id：frps 据此做会话交接（handoff），释放旧控制连接；
+       若传空则被视为新客户端，旧控制连接仍占用代理名，会导致注册报 already exists */
+    char *json = login_msg_build(cl->cfg, cl->run_id, now);
     if (json) {
         conn_write_msg(&cl->ctl, FRP_MSG_LOGIN, json);
         free(json);
@@ -296,8 +314,16 @@ static void register_all_proxies(struct frp_client *cl)
         if (!json) continue;
         conn_write_msg(&cl->ctl, FRP_MSG_NEW_PROXY, json);
         free(json);
-        log_info("已发送代理注册请求 [%s] 类型=%s 远程端口=%d",
-                 px->cfg->name, px->cfg->type, px->cfg->remote_port);
+        if (strcmp(px->cfg->type, "http") == 0 || strcmp(px->cfg->type, "https") == 0) {
+            log_info("已发送代理注册请求 [%s] 类型=%s 域名=%s%s%s",
+                     px->cfg->name, px->cfg->type,
+                     px->cfg->custom_domains[0] ? px->cfg->custom_domains : "",
+                     (px->cfg->custom_domains[0] && px->cfg->subdomain[0]) ? "," : "",
+                     px->cfg->subdomain[0] ? px->cfg->subdomain : "");
+        } else {
+            log_info("已发送代理注册请求 [%s] 类型=%s 远程端口=%d",
+                     px->cfg->name, px->cfg->type, px->cfg->remote_port);
+        }
     }
 }
 
@@ -323,8 +349,8 @@ static void on_login_success(struct frp_client *cl, const char *run_id)
     register_all_proxies(cl);
 }
 
-/* 处理控制连接的消息帧 */
-static void ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json)
+/* 处理控制连接的消息帧（控制连接不会被本回调释放，恒返回 0） */
+static int ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json)
 {
     struct frp_client *cl = c->ctx;
 
@@ -340,7 +366,7 @@ static void ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json)
             } else {
                 schedule_reconnect(cl);
             }
-            return;
+            return 0;
         }
         on_login_success(cl, resp.run_id);
         break;
@@ -353,13 +379,16 @@ static void ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json)
         new_proxy_resp_parse(json, &resp);
         if (resp.error[0]) {
             log_error("代理 [%s] 注册失败: %s", resp.proxy_name, resp.error);
-        } else {
-            /* frps 返回的 remote_addr 常为「:端口」，补上服务端地址显示完整 */
-            const char *p = strrchr(resp.remote_addr, ':');
-            const char *port = (p && *(p + 1)) ? p + 1 : resp.remote_addr;
+        } else if (resp.remote_addr[0] == ':') {
+            /* tcp/udp：frps 返回「:端口」，补上服务端地址显示完整 */
             char hp[300];
-            frp_format_hostport(hp, sizeof(hp), cl->cfg->server_addr, atoi(port));
+            frp_format_hostport(hp, sizeof(hp), cl->cfg->server_addr, atoi(resp.remote_addr + 1));
             log_info("代理 [%s] 注册成功，远程地址 %s", resp.proxy_name, hp);
+        } else if (resp.remote_addr[0]) {
+            /* http/https：frps 返回「域名:端口」（多域名逗号分隔），直接显示 */
+            log_info("代理 [%s] 注册成功，访问地址 %s", resp.proxy_name, resp.remote_addr);
+        } else {
+            log_info("代理 [%s] 注册成功", resp.proxy_name);
         }
         break;
     }
@@ -369,7 +398,7 @@ static void ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json)
             /* Pong 携带 error 视为心跳异常，断开重连（对齐 Go handlePong） */
             log_error("收到带错误的 Pong: %s", perr);
             schedule_reconnect(cl);
-            return;
+            return 0;
         }
         cl->last_pong = time(NULL);
         log_debug("收到 Pong 心跳响应");
@@ -383,6 +412,7 @@ static void ctl_on_frame(struct frp_conn *c, uint8_t type, const char *json)
         log_warn("收到未知控制消息类型: 0x%02x", type);
         break;
     }
+    return 0;
 }
 
 /* ---- 控制连接：yamux 模式 ---- */
@@ -486,8 +516,11 @@ static struct proxy *find_proxy(struct frp_client *cl, const char *name)
     return NULL;
 }
 
-/* work 连接收到 StartWorkConn 后，建立隧道 */
-static void tunnel_start(struct tunnel *t, struct start_work_conn *swc)
+/*
+ * work 连接收到 StartWorkConn 后，建立隧道。
+ * 返回 0 = 隧道已建立；返回 -1 = 已 tunnel_free（调用方不得再访问 t / c）。
+ */
+static int tunnel_start(struct tunnel *t, struct start_work_conn *swc)
 {
     struct proxy *px = t->px;
     struct frp_client *cl = px->client;
@@ -497,7 +530,7 @@ static void tunnel_start(struct tunnel *t, struct start_work_conn *swc)
         log_error("代理 [%s] 连接本地服务 %s:%d 失败",
                   px->cfg->name, px->cfg->local_ip, px->cfg->local_port);
         tunnel_free(t);
-        return;
+        return -1;
     }
 
     t->local_bev = lbev;
@@ -524,10 +557,14 @@ static void tunnel_start(struct tunnel *t, struct start_work_conn *swc)
     log_info("代理 [%s] 隧道建立: %s:%d -> 本地 %s:%d",
              px->cfg->name, swc->src_addr, swc->src_port,
              px->cfg->local_ip, px->cfg->local_port);
+    return 0;
 }
 
-/* work 连接收到 StartWorkConn 帧（登录后数据前） */
-static void work_on_frame(struct frp_conn *c, uint8_t type, const char *json)
+/*
+ * work 连接收到 StartWorkConn 帧（登录后数据前）。
+ * 返回 -1 表示已 tunnel_free（c == &t->work 已失效），调用方必须停止访问。
+ */
+static int work_on_frame(struct frp_conn *c, uint8_t type, const char *json)
 {
     struct tunnel *t = c->ctx;
 
@@ -537,23 +574,23 @@ static void work_on_frame(struct frp_conn *c, uint8_t type, const char *json)
         if (swc.error[0]) {
             log_error("工作连接建立失败: %s", swc.error);
             tunnel_free(t);
-            return;
+            return -1;
         }
         struct frp_client *cl = t->px->client;
         struct proxy *px = find_proxy(cl, swc.proxy_name);
         if (!px) {
             log_error("工作连接引用了未知代理: %s", swc.proxy_name);
             tunnel_free(t);
-            return;
+            return -1;
         }
         t->px = px;
         if (strcmp(px->cfg->type, "udp") == 0) {
             t->is_udp = 1;
-            udp_tunnel_start(t, &swc);
-        } else {
-            tunnel_start(t, &swc);
+            return udp_tunnel_start(t, &swc);
         }
+        return tunnel_start(t, &swc);
     }
+    return 0;
 }
 
 /* work 连接数据转发到本地 */
@@ -601,7 +638,8 @@ static void udp_ping_cb(int fd, short what, void *ctx)
     evtimer_add(t->udp_ping_ev, &tv);
 }
 
-static void udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc)
+/* 返回 0 = 已建立；返回 -1 = 已 tunnel_free（调用方不得再访问 t / c） */
+static int udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc)
 {
     (void)swc;
     struct proxy *px = t->px;
@@ -617,7 +655,7 @@ static void udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc)
     if (getaddrinfo(px->cfg->local_ip, portstr, &hints, &res) != 0) {
         log_error("代理 [%s] 解析本地地址 %s 失败", px->cfg->name, px->cfg->local_ip);
         tunnel_free(t);
-        return;
+        return -1;
     }
     memcpy(&t->local_addr, res->ai_addr, res->ai_addrlen);
     t->local_addrlen = res->ai_addrlen;
@@ -628,7 +666,7 @@ static void udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc)
     if (fd < 0) {
         log_error("代理 [%s] 创建本地 UDP socket 失败", px->cfg->name);
         tunnel_free(t);
-        return;
+        return -1;
     }
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -650,6 +688,7 @@ static void udp_tunnel_start(struct tunnel *t, struct start_work_conn *swc)
 
     log_info("代理 [%s] UDP 隧道建立，本地 %s:%d", px->cfg->name,
              px->cfg->local_ip, px->cfg->local_port);
+    return 0;
 }
 
 /* 从 sockaddr 提取 IP 字符串和端口 */
@@ -669,8 +708,8 @@ static void sockaddr_to_ip_port(const struct sockaddr_storage *ss, char *ip, siz
     }
 }
 
-/* work 连接收到 UDPPacket 帧 */
-static void udp_work_on_frame(struct frp_conn *c, uint8_t type, const char *json)
+/* work 连接收到 UDPPacket 帧（本回调不释放 tunnel，恒返回 0） */
+static int udp_work_on_frame(struct frp_conn *c, uint8_t type, const char *json)
 {
     struct tunnel *t = c->ctx;
 
@@ -710,7 +749,7 @@ static void udp_work_on_frame(struct frp_conn *c, uint8_t type, const char *json
                     free(combined);
                     t->pp_sent = 1;
                     udp_packet_free(&p);
-                    return;
+                    return 0;
                 }
             }
 
@@ -720,6 +759,7 @@ static void udp_work_on_frame(struct frp_conn *c, uint8_t type, const char *json
         udp_packet_free(&p);
     }
     /* 其他类型（如服务端不回 Pong）忽略：UDP work 连接由本端单向发 Ping 保活 */
+    return 0;
 }
 
 /* 本地 UDP 回包，封 UDPPacket 发回 */
@@ -736,10 +776,17 @@ static void udp_local_read_cb(int fd, short what, void *ctx)
     int port;
     sockaddr_to_ip_port(&t->raddr, ip, sizeof(ip), &port);
     char *json = udp_packet_msg_build(buf, (size_t)n, ip, port);
-    if (json) {
-        conn_write_msg(&t->work, FRP_MSG_UDP_PACKET, json);
-        free(json);
+    if (!json) {
+        log_error("代理 [%s] UDP 回包编码失败（%zd 字节），已丢弃", t->px->cfg->name, n);
+        return;
     }
+    /* 编码后 JSON 受 FRP_MAX_MSG_LEN 限制（约 7.6KB 原始载荷），超限会发送失败。
+       必须检查返回值，否则超大 UDP 包会被静默丢弃。 */
+    if (conn_write_msg(&t->work, FRP_MSG_UDP_PACKET, json) < 0) {
+        log_warn("代理 [%s] UDP 回包 %zd 字节超过单包上限（编码后 > %d），已丢弃",
+                 t->px->cfg->name, n, FRP_MAX_MSG_LEN);
+    }
+    free(json);
 }
 
 /* 协议错误处理 */
@@ -790,7 +837,8 @@ static void client_reset(struct frp_client *cl)
     }
     memset(&cl->ctl, 0, sizeof(cl->ctl));
     cl->logged_in = 0;
-    cl->run_id[0] = '\0';
+    /* run_id 故意保留：重连时用于 frps 会话交接（handoff）；
+       登录成功后由 on_login_success 更新为服务端返回的新值 */
 }
 
 /* 安排断线重连（固定间隔） */
@@ -1096,25 +1144,37 @@ int client_run(struct minifrpc_config *cfg)
         evtimer_add(cl.heartbeat_ev, &hb_tv);
     }
 
+    int first_connect_ok = 1;
     if (cfg->tcp_mux) {
         cl.session = yamux_client(cl.base, cfg->server_addr, cfg->server_port);
         if (!cl.session) {
             char hp[300];
             frp_format_hostport(hp, sizeof(hp), cfg->server_addr, cfg->server_port);
             log_error("无法连接服务器 %s", hp);
-            free(cl.proxies);
-            event_base_free(cl.base);
-            return -1;
+            first_connect_ok = 0;
+        } else {
+            cl.session->on_connect = on_session_connect;
+            cl.session->on_close = on_session_close;
+            cl.session->ctx = &cl;
         }
-        cl.session->on_connect = on_session_connect;
-        cl.session->on_close = on_session_close;
-        cl.session->ctx = &cl;
     } else {
         if (ctl_connect(&cl) != 0) {
+            first_connect_ok = 0;
+        }
+    }
+
+    /*
+     * 首次连接失败的处理：loginFailExit=true（默认，对齐 Go）直接退出；
+     * false 时不退出，交由重连定时器持续重试（对齐 Go 的 loopLoginUntilSuccess）。
+     */
+    if (!first_connect_ok) {
+        if (cfg->login_fail_exit) {
             free(cl.proxies);
             event_base_free(cl.base);
             return -1;
         }
+        log_info("loginFailExit=false，将持续重试连接服务器");
+        schedule_reconnect(&cl);
     }
 
     log_info("开始事件循环");

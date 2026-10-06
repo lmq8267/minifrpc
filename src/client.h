@@ -35,7 +35,12 @@ struct frp_conn {
     int cfb_enabled;             /* 是否启用加密（控制连接登录后为 1） */
     struct evbuffer *plain;      /* 解密后的明文帧缓冲 */
     int frame_mode;              /* 1=帧模式（type+len+json），0=数据模式（裸字节） */
-    void (*on_frame)(struct frp_conn *c, uint8_t type, const char *json);
+    /*
+     * 帧回调。返回 0 = 继续处理下一帧；
+     * 返回 -1 = 该连接已失效（回调内可能已 free 掉 conn 所在结构体），
+     * 调用方必须立即停止访问 conn 与其缓冲区。
+     */
+    int (*on_frame)(struct frp_conn *c, uint8_t type, const char *json);
     void (*on_data)(struct frp_conn *c, struct evbuffer *data);
     void (*on_error)(struct frp_conn *c);  /* 协议错误时回调（可空） */
     void *ctx;

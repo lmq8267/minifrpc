@@ -11,13 +11,21 @@
 /* 单个代理配置（对应 [[proxies]] 数组元素） */
 struct proxy_config {
     char name[128];                     /* 代理名 */
-    char type[16];                      /* 代理类型，仅支持 tcp/udp */
+    char type[16];                      /* 代理类型，支持 tcp/udp/http/https */
     char local_ip[64];                  /* 本地服务 IP */
     int  local_port;                    /* 本地服务端口 */
-    int  remote_port;                   /* frps 监听端口 */
+    int  remote_port;                   /* frps 监听端口（tcp/udp） */
     char proxy_protocol_version[8];     /* 空 / v1 / v2 */
     int  use_encryption;                /* 是否启用传输加密（暂不支持） */
     int  use_compression;               /* 是否启用压缩（暂不支持） */
+
+    /* HTTP/HTTPS 代理专有字段（经 frps 的 vhostHttp(s)Port 按域名路由） */
+    char custom_domains[512];           /* 自定义域名，多个以逗号分隔 */
+    char subdomain[128];                /* 子域名（与 frps 的 subDomainHost 拼接） */
+    char locations[512];                /* URL 路径前缀，多个以逗号分隔（仅 http） */
+    char http_user[128];                /* 访问认证用户名（Basic Auth，仅 http） */
+    char http_password[128];            /* 访问认证密码（仅 http） */
+    char host_header_rewrite[256];      /* 转发时重写的 Host 头（仅 http） */
 };
 
 /* 客户端全局配置（对应 TOML 顶层 + [transport]/[auth]/[log]） */

@@ -21,7 +21,7 @@
 专为嵌入式设备设计：依赖少、体积小、能用 `musl-gcc` 交叉编译为**完全静态的单文件**，无需任何运行时依赖。
 
 - 协议：frp `v1` wire 协议（兼容默认开启的 `tcpMux` / yamux）
-- 功能：**TCP 代理、UDP 代理、Proxy Protocol v2**、中文日志
+- 功能：**TCP / UDP / HTTP / HTTPS 代理、Proxy Protocol v2**、中文日志
 - 体积：静态编译 + strip 后约 **250KB**（对比同类型的 [xfrpc](https://github.com/lmq8267/xfrpc) 静态大小约 8MB）
 
 ## 特性
@@ -33,10 +33,11 @@
 | 完全静态 | musl 静态链接，单文件部署，无动态库依赖 |
 | 兼容 Go frps | 支持 v1 协议与 yamux（tcpMux）多路复用 |
 | TCP / UDP 代理 | 完整的 remote_port 转发 |
+| HTTP / HTTPS 代理 | 经 frps vhost 路由（http 按 `Host`、https 按 TLS SNI），支持自定义域名 / 子域名 / 路径 / 访问认证 / Host 重写 |
 | Proxy Protocol v2 | 向本地服务传递真实客户端 IP（TCP/UDP 均支持） |
 | 高并发 | epoll + libevent reactor，单线程事件驱动 |
 | 中文日志 | 日志中文输出，时间戳为**北京时区**（Asia/Shanghai） |
-| 明确报错 | 遇到不支持的功能（如 HTTP/TLS/加密）时输出中文错误并退出，不静默忽略 |
+| 明确报错 | 遇到不支持的功能（如 TLS/加密/压缩/其他代理类型）时输出中文错误并退出，不静默忽略 |
 | 优雅退出 | 处理 `SIGINT` / `SIGTERM`，退出前清理全部连接 |
 
 ## 体积与性能
@@ -101,7 +102,7 @@ minifrpc/
 | 文件 | 作用 |
 |------|------|
 | `src/frp_msg.c` `frp_msg.h` | frp v1 消息帧（`1字节type + 8字节大端长度 + JSON`）的编解码；Login / NewProxy / NewWorkConn / StartWorkConn / UDPPacket 等消息结构；`privilege_key` 计算 |
-| `src/client.c` `client.h` | 客户端核心：控制连接登录、代理注册、心跳、工作连接与隧道建立、TCP/UDP 数据转发、Proxy Protocol v2 注入、信号处理与退出清理 |
+| `src/client.c` `client.h` | 客户端核心：控制连接登录、代理注册、心跳、工作连接与隧道建立、TCP/UDP/HTTP(S) 数据转发、Proxy Protocol v2 注入、信号处理与退出清理 |
 | `src/yamux.c` `yamux.h` | yamux 客户端协议（帧、流、窗口流控、keepalive），实现 tcpMux 多路复用 |
 | `src/proxyproto.c` `proxyproto.h` | 构造 HAProxy PROXY protocol v2 头（IPv4/IPv6、TCP/UDP） |
 | `src/base64.c` `base64.h` | 标准 base64 编解码，用于 UDP 包内容的封包/解包 |
@@ -205,6 +206,27 @@ localIP = "127.0.0.1"
 localPort = 8585
 remotePort = 18585
 transport.proxyProtocolVersion = "v2"
+
+# HTTP 代理（经 frps 的 vhostHttpPort 按域名路由，需把域名解析到 frps）
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8080
+customDomains = ["web.example.com"]
+# subdomain = "web"                 # 或使用子域名（需 frps 配置 subDomainHost）
+# locations = ["/api", "/static"]   # 按 URL 路径前缀路由
+# httpUser = "admin"                # Basic Auth 访问认证
+# httpPassword = "123456"
+# hostHeaderRewrite = "127.0.0.1"   # 转发给本地服务时重写 Host 头
+
+# HTTPS 代理（frps 按 TLS SNI 路由并透传，本地服务必须是 HTTPS）
+[[proxies]]
+name = "web-tls"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 8443
+customDomains = ["web.example.com"]
 ```
 
 ### 顶层字段
@@ -218,7 +240,7 @@ transport.proxyProtocolVersion = "v2"
 | `transport.protocol` | `tcp` | 仅支持 `tcp` |
 | `transport.tls.enable` | `false` | 仅支持 `false` |
 | `transport.tcpMux` | `true` | 是否使用 yamux 多路复用 |
-| `transport.poolCount` | `1` | 工作连接池大小 |
+| `transport.poolCount` | `1` | 工作连接池大小。**高并发场景建议调大**（如 `10`），并同步调大 frps 的 `transport.maxPoolCount`（默认 `5`）；否则池满时 frps 会拒绝新连接并在自身日志中留下错误记录 |
 | `transport.heartbeatInterval` | tcpMux 关时 `30` | 心跳间隔（秒） |
 | `transport.heartbeatTimeout` | tcpMux 关时 `90` | 心跳超时（秒） |
 | `log.level` | `info` | 日志级别：trace/debug/info/warn/error |
@@ -226,14 +248,19 @@ transport.proxyProtocolVersion = "v2"
 
 ### 代理字段（`[[proxies]]`）
 
-| 字段 | 说明 |
-|------|------|
-| `name` | 代理名（唯一） |
-| `type` | `tcp` 或 `udp` |
-| `localIP` | 本地服务地址（默认 `127.0.0.1`） |
-| `localPort` | 本地服务端口 |
-| `remotePort` | frps 监听的公网端口 |
-| `transport.proxyProtocolVersion` | 空 / `v2`（仅支持 v2） |
+| 字段 | 适用类型 | 说明 |
+|------|----------|------|
+| `name` | 全部 | 代理名（唯一） |
+| `type` | 全部 | `tcp` / `udp` / `http` / `https` |
+| `localIP` | 全部 | 本地服务地址（默认 `127.0.0.1`） |
+| `localPort` | 全部 | 本地服务端口 |
+| `remotePort` | tcp/udp | frps 监听的公网端口 |
+| `customDomains` | http/https | 自定义域名列表（与 `subdomain` 至少填一个） |
+| `subdomain` | http/https | 子域名（与 frps 的 `subDomainHost` 拼接后对外生效） |
+| `locations` | http | URL 路径前缀列表（按路径路由） |
+| `httpUser` / `httpPassword` | http | Basic Auth 访问认证 |
+| `hostHeaderRewrite` | http | 转发给本地服务时重写的 `Host` 头 |
+| `transport.proxyProtocolVersion` | tcp/udp | 空 / `v2`（仅支持 v2） |
 
 ## 运行
 
@@ -262,14 +289,26 @@ minifrpc -c /etc/frp/frpc.toml >/dev/null 2>&1 &
 |------|------|------|
 | `tcp` | ✅ 支持 | TCP 端口转发 |
 | `udp` | ✅ 支持 | UDP 端口转发 |
+| `http` | ✅ 支持 | frps 解析 HTTP 并按 `Host` / 路径路由，转发明文 HTTP 到本地 HTTP 服务 |
+| `https` | ✅ 支持 | frps 仅按 **TLS SNI** 路由并**透传** TLS，`localPort` 须为 **HTTPS** 服务 |
 | Proxy Protocol `v2` | ✅ 支持 | TCP / UDP 均可向本地服务注入真实客户端 IP |
+
+> **HTTP / HTTPS 代理说明**：客户端侧两者都只是 TCP 隧道转发（连 `localPort` 后双向转发），不解析 HTTP、**不加载任何证书、不需要 TLS 库**。
+> 差别在 frps 侧：`http` 由 frps 解析 HTTP 并按 `Host` / 路径路由（本地是明文 HTTP 服务）；
+> `https` 则 frps 只读取 ClientHello 的 SNI 做路由，随后**原样透传整个 TLS 流**（本地必须是 HTTPS 服务，TLS 由本地服务终止）。
+> 使用前提是 frps 已启用对应的 vhost 端口（`vhostHTTPPort` / `vhostHTTPSPort`），并把域名解析到 frps；
+> 使用 `subdomain` 时还需 frps 配置 `subDomainHost`；`customDomains` 不能与 `subDomainHost` 的域重叠，否则 frps 会拒绝注册。
 
 ## 不支持的配置（遇到即报错退出）
 
 以下功能**未实现**，配置中出现时会输出中文错误并终止，避免静默失效：
 
-- 代理类型：`http` / `https` / `stcp` / `xtcp` / `sudp` / `tcpmux`
-- 传输加密：`transport.tls.enable = true`
+- 代理类型：`stcp` / `xtcp` / `sudp` / `tcpmux`
+- 代理筛选与加载：顶层 `start` / `includes`（会导致「只加载部分代理」的配置失效）
+- 代理级：`enabled` / `plugin` / `loadBalancer` / `healthCheck` / `metadatas` / `annotations`
+- 传输层：`proxyURL` / `wireProtocol` / `connectServerLocalIP` / `udpPacketSize`
+- HTTP 代理的 `requestHeaders` / `responseHeaders` / `routeByHTTPUser`（请求响应头改写与按用户路由）
+- 传输加密：`transport.tls.enable = true`（客户端与 frps 之间的 TLS）
 - `useEncryption` / `useCompression`（数据面加密与压缩）
 - `bandwidthLimit`（限速）
 - `transport.protocol` 非 `tcp`（如 `kcp` / `quic` / `websocket`）

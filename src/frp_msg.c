@@ -70,6 +70,39 @@ static int jget_int(json_object *obj, const char *key, int def)
     return def;
 }
 
+/*
+ * 将逗号分隔字符串拆分为 JSON 字符串数组（返回新对象，调用者负责释放）。
+ * keep_empty=1 时保留空项：locations 中的 "" 表示 catch-all 路由（与 frp 语义一致）。
+ */
+static json_object *csv_to_json_array_ex(const char *csv, int keep_empty)
+{
+    json_object *arr = json_object_new_array();
+    if (!arr) return NULL;
+
+    const char *p = csv;
+    while (1) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len < 256) {
+            char item[256];
+            memcpy(item, p, len);
+            item[len] = '\0';
+            if (len > 0 || keep_empty) {
+                json_object_array_add(arr, json_object_new_string(item));
+            }
+        }
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return arr;
+}
+
+/* 拆分逗号分隔字符串（跳过空项，用于 customDomains） */
+static json_object *csv_to_json_array(const char *csv)
+{
+    return csv_to_json_array_ex(csv, 0);
+}
+
 /* ---- 认证 ---- */
 void frp_auth_key(const char *token, int64_t timestamp, char out[33])
 {
@@ -139,7 +172,36 @@ char *new_proxy_msg_build(const struct proxy_config *px)
     json_object *obj = json_object_new_object();
     json_object_object_add(obj, "proxy_name", json_object_new_string(px->name));
     json_object_object_add(obj, "proxy_type", json_object_new_string(px->type));
-    json_object_object_add(obj, "remote_port", json_object_new_int(px->remote_port));
+
+    if (strcmp(px->type, "http") == 0 || strcmp(px->type, "https") == 0) {
+        /* HTTP/HTTPS 代理：frps 侧 vhost 按域名路由（http 按 Host，https 按 SNI），不发送 remote_port */
+        if (px->custom_domains[0]) {
+            json_object *arr = csv_to_json_array(px->custom_domains);
+            if (arr) json_object_object_add(obj, "custom_domains", arr);
+        }
+        if (px->subdomain[0]) {
+            json_object_object_add(obj, "subdomain", json_object_new_string(px->subdomain));
+        }
+        /* locations / 认证 / Host 重写仅 http 类型支持 */
+        if (strcmp(px->type, "http") == 0) {
+            if (px->locations[0]) {
+                json_object *arr = csv_to_json_array_ex(px->locations, 1);
+                if (arr) json_object_object_add(obj, "locations", arr);
+            }
+            if (px->host_header_rewrite[0]) {
+                json_object_object_add(obj, "host_header_rewrite",
+                                       json_object_new_string(px->host_header_rewrite));
+            }
+            if (px->http_user[0]) {
+                json_object_object_add(obj, "http_user", json_object_new_string(px->http_user));
+            }
+            if (px->http_password[0]) {
+                json_object_object_add(obj, "http_pwd", json_object_new_string(px->http_password));
+            }
+        }
+    } else {
+        json_object_object_add(obj, "remote_port", json_object_new_int(px->remote_port));
+    }
 
     char *ret = strdup(json_object_to_json_string(obj));
     json_object_put(obj);

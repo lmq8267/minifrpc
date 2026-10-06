@@ -1,5 +1,5 @@
 # minifrpc 示例配置（对齐 frp 0.71 TOML 格式）
-# 当前仅支持 TCP/UDP 代理 + Proxy Protocol v2
+# 支持 TCP / UDP / HTTP / HTTPS 代理 + Proxy Protocol v2
 
 # 用户标识（可选）
 user = "s-00tnkgv5445sv"
@@ -44,3 +44,26 @@ remotePort = 18080
 # localPort = 8083
 # remotePort = 18083
 # transport.proxyProtocolVersion = "v2"
+
+# HTTP 代理示例（frps 需配置 vhostHttpPort，并把域名解析到 frps）
+# [[proxies]]
+# name = "web"
+# type = "http"
+# localIP = "127.0.0.1"
+# localPort = 8080
+# customDomains = ["web.example.com"]
+# # 也可用 subdomain（需 frps 配置 subDomainHost）
+# # subdomain = "web"
+# # 可选：路径前缀、访问认证、Host 重写
+# # locations = ["/api", "/static"]
+# # httpUser = "admin"
+# # httpPassword = "123456"
+# # hostHeaderRewrite = "127.0.0.1"
+
+# HTTPS 代理示例（frps 按 TLS SNI 路由并透传，本地服务必须是 HTTPS）
+# [[proxies]]
+# name = "web-tls"
+# type = "https"
+# localIP = "127.0.0.1"
+# localPort = 8443
+# customDomains = ["web.example.com"]

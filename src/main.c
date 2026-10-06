@@ -136,10 +136,18 @@ int main(int argc, char **argv)
     }
     for (int i = 0; i < cfg.proxy_count; i++) {
         struct proxy_config *px = &cfg.proxies[i];
-        log_info("代理 [%s] 类型=%s 本地=%s:%d 远程端口=%d Proxy协议=%s",
-                 px->name, px->type, px->local_ip, px->local_port,
-                 px->remote_port,
-                 px->proxy_protocol_version[0] ? px->proxy_protocol_version : "未开启");
+        if (strcmp(px->type, "http") == 0 || strcmp(px->type, "https") == 0) {
+            log_info("代理 [%s] 类型=%s 本地=%s:%d 域名=%s%s%s",
+                     px->name, px->type, px->local_ip, px->local_port,
+                     px->custom_domains[0] ? px->custom_domains : "",
+                     (px->custom_domains[0] && px->subdomain[0]) ? "," : "",
+                     px->subdomain[0] ? px->subdomain : "");
+        } else {
+            log_info("代理 [%s] 类型=%s 本地=%s:%d 远程端口=%d Proxy协议=%s",
+                     px->name, px->type, px->local_ip, px->local_port,
+                     px->remote_port,
+                     px->proxy_protocol_version[0] ? px->proxy_protocol_version : "未开启");
+        }
     }
 
     log_info("启动客户端，按 Ctrl+C 退出");

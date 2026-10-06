@@ -3,9 +3,9 @@
  * config.c —— 配置解析（tomlc17 解析 frp 0.71 TOML 配置）
  *
  * 支持的功能：
- *   - TCP / UDP 代理
+ *   - TCP / UDP / HTTP / HTTPS 代理
  *   - Proxy Protocol v2
- * 解析到不支持的功能（HTTP/TLS/加密/压缩/其他协议等）时输出中文错误并返回失败。
+ * 解析到不支持的功能（TLS/加密/压缩/其他代理类型等）时输出中文错误并返回失败。
  */
 
 #include "config.h"
@@ -52,6 +52,34 @@ static int get_bool(toml_datum_t tab, const char *key, int def)
     return def;
 }
 
+/*
+ * 读取 TOML 字符串数组并拼接为逗号分隔字符串（不存在则置空）。
+ * 内容超出缓冲区时返回 -1，避免静默截断导致字段丢失后报出误导性错误。
+ */
+static int get_str_array_csv(toml_datum_t tab, const char *key, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    toml_datum_t d = toml_get(tab, key);
+    if (d.type != TOML_ARRAY) return 0;
+
+    size_t used = 0;
+    for (int i = 0; i < d.u.arr.size; i++) {
+        toml_datum_t e = d.u.arr.elem[i];
+        if (e.type != TOML_STRING || !e.u.s) continue;
+        size_t sl = strlen(e.u.s);
+        if (used + sl + 2 > out_sz) {
+            log_error("配置项 %s 的第 %d 项过长（内容超过 %zu 字节），请缩短",
+                      key, i + 1, out_sz);
+            return -1;
+        }
+        if (used > 0) out[used++] = ',';
+        memcpy(out + used, e.u.s, sl);
+        used += sl;
+        out[used] = '\0';
+    }
+    return 0;
+}
+
 /* 判断某个键是否存在（用于检测显式配置了不支持的功能） */
 static int key_exists(toml_datum_t tab, const char *key)
 {
@@ -73,27 +101,89 @@ static int parse_proxy(toml_datum_t elem, struct proxy_config *px)
     px->local_port = (int)get_int(elem, "localPort", 0);
     px->remote_port = (int)get_int(elem, "remotePort", 0);
 
-    /* 类型检查：仅支持 tcp / udp */
-    if (px->type[0] != '\0' &&
-        strcmp(px->type, "tcp") != 0 && strcmp(px->type, "udp") != 0) {
-        log_error("代理 [%s] 的类型 \"%s\" 暂不支持，当前仅支持 tcp/udp", px->name, px->type);
-        return -1;
-    }
+    /* 类型检查：支持 tcp / udp / http / https */
     if (px->type[0] == '\0') {
         log_error("代理缺少 type 字段");
+        return -1;
+    }
+    if (strcmp(px->type, "tcp") != 0 &&
+        strcmp(px->type, "udp") != 0 &&
+        strcmp(px->type, "http") != 0 &&
+        strcmp(px->type, "https") != 0) {
+        log_error("代理 [%s] 的类型 \"%s\" 暂不支持，当前仅支持 tcp/udp/http/https", px->name, px->type);
         return -1;
     }
     if (px->name[0] == '\0') {
         log_error("代理缺少 name 字段");
         return -1;
     }
-    if (px->remote_port <= 0 || px->remote_port > 65535) {
-        log_error("代理 [%s] 的 remotePort 无效: %d", px->name, px->remote_port);
-        return -1;
-    }
     if (px->local_port <= 0 || px->local_port > 65535) {
         log_error("代理 [%s] 的 localPort 无效: %d", px->name, px->local_port);
         return -1;
+    }
+
+    /* 代理级不支持项：出现即报错，避免静默失效 */
+    {
+        static const char *unsup[] = {
+            "enabled", "plugin", "loadBalancer", "healthCheck",
+            "metadatas", "annotations", NULL
+        };
+        for (int i = 0; unsup[i]; i++) {
+            if (key_exists(elem, unsup[i])) {
+                log_error("代理 [%s] 的配置项 %s 暂不支持", px->name, unsup[i]);
+                return -1;
+            }
+        }
+    }
+
+    if (strcmp(px->type, "http") == 0 || strcmp(px->type, "https") == 0) {
+        /* ---- HTTP/HTTPS 代理：frps 侧 vhost 按域名路由（http 按 Host，https 按 TLS SNI），无需 remotePort ---- */
+        get_str_array_csv(elem, "customDomains", px->custom_domains, sizeof(px->custom_domains));
+        get_str(elem, "subdomain", px->subdomain, sizeof(px->subdomain), "");
+
+        if (px->custom_domains[0] == '\0' && px->subdomain[0] == '\0') {
+            log_error("代理 [%s] 为 %s 类型，必须配置 customDomains 或 subdomain",
+                      px->name, px->type);
+            return -1;
+        }
+
+        if (strcmp(px->type, "http") == 0) {
+            get_str_array_csv(elem, "locations", px->locations, sizeof(px->locations));
+            get_str(elem, "httpUser", px->http_user, sizeof(px->http_user), "");
+            get_str(elem, "httpPassword", px->http_password, sizeof(px->http_password), "");
+            get_str(elem, "hostHeaderRewrite", px->host_header_rewrite,
+                    sizeof(px->host_header_rewrite), "");
+
+            /* 暂不支持的 http 字段：出现即报错，避免静默失效 */
+            if (key_exists(elem, "requestHeaders")) {
+                log_error("代理 [%s] 的 requestHeaders（请求头改写）暂不支持", px->name);
+                return -1;
+            }
+            if (key_exists(elem, "responseHeaders")) {
+                log_error("代理 [%s] 的 responseHeaders（响应头改写）暂不支持", px->name);
+                return -1;
+            }
+            if (key_exists(elem, "routeByHTTPUser")) {
+                log_error("代理 [%s] 的 routeByHTTPUser 暂不支持", px->name);
+                return -1;
+            }
+        } else {
+            /* https 代理仅按域名路由，不支持 http 专有字段 */
+            if (key_exists(elem, "locations") || key_exists(elem, "httpUser") ||
+                key_exists(elem, "httpPassword") || key_exists(elem, "hostHeaderRewrite") ||
+                key_exists(elem, "requestHeaders") || key_exists(elem, "responseHeaders") ||
+                key_exists(elem, "routeByHTTPUser")) {
+                log_error("代理 [%s] 为 https 类型，不支持 http 专有字段"
+                          "（locations/httpUser/httpPassword/hostHeaderRewrite 等）", px->name);
+                return -1;
+            }
+        }
+    } else {
+        /* ---- tcp / udp：需要 remotePort ---- */
+        if (px->remote_port <= 0 || px->remote_port > 65535) {
+            log_error("代理 [%s] 的 remotePort 无效: %d", px->name, px->remote_port);
+            return -1;
+        }
     }
 
     /* transport 子表（可选） */
@@ -149,6 +239,18 @@ int config_load(const char *cfg_path, struct minifrpc_config *cfg)
         return -1;
     }
 
+    /* 顶层不支持项：出现即报错，避免静默失效 */
+    {
+        static const char *unsup[] = { "start", "includes", NULL };
+        for (int i = 0; unsup[i]; i++) {
+            if (key_exists(top, unsup[i])) {
+                log_error("配置项 %s 暂不支持（会改变代理筛选或配置加载行为）", unsup[i]);
+                toml_free(res);
+                return -1;
+            }
+        }
+    }
+
     /* ---- 认证 [auth] ---- */
     toml_datum_t auth = toml_get(top, "auth");
     if (auth.type == TOML_TABLE) {
@@ -191,6 +293,20 @@ int config_load(const char *cfg_path, struct minifrpc_config *cfg)
 
     toml_datum_t tr = toml_get(top, "transport");
     if (tr.type == TOML_TABLE) {
+        /* transport 级不支持项：出现即报错，避免静默失效 */
+        {
+            static const char *unsup[] = {
+                "proxyURL", "wireProtocol", "connectServerLocalIP", "udpPacketSize", NULL
+            };
+            for (int i = 0; unsup[i]; i++) {
+                if (key_exists(tr, unsup[i])) {
+                    log_error("transport.%s 暂不支持", unsup[i]);
+                    toml_free(res);
+                    return -1;
+                }
+            }
+        }
+
         get_str(tr, "protocol", cfg->protocol, sizeof(cfg->protocol), "tcp");
         if (strcmp(cfg->protocol, "tcp") != 0) {
             log_error("传输协议 transport.protocol=\"%s\" 暂不支持，仅支持 tcp", cfg->protocol);
